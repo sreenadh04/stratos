@@ -274,15 +274,40 @@ def get_dashboard():
   <div class="competitors">{competitor_cards}</div>
   <div class="section-head"><div class="section-title">Latest signals</div><div class="section-meta">Run #{run_id_short}</div></div>
   <div class="signal-feed">{signal_html}</div>
-  <div class="trigger-bar">
-    <div class="trigger-text">Run the pipeline manually — <span class="mono">POST /runs</span></div>
-    <form action="/runs" method="post" style="margin:0;"><button type="submit" class="btn-trigger">RUN NOW</button></form>
+  <div class="trigger-bar" id="trigger-bar">
+    <div class="trigger-text" id="trigger-text">Run the pipeline manually — <span class="mono">POST /runs</span></div>
+    <button class="btn-trigger" id="run-btn" onclick="triggerRun()">RUN NOW</button>
   </div>
   <div class="footer">
     <span>StratOS v1.0 — autonomous intelligence pipeline</span>
     <a href="/docs">API docs →</a>
   </div>
 </div>
+<script>
+function triggerRun() {{
+  const btn = document.getElementById('run-btn');
+  const text = document.getElementById('trigger-text');
+  btn.disabled = true;
+  btn.textContent = 'RUNNING...';
+  btn.style.opacity = '0.6';
+  text.innerHTML = 'Pipeline started — scanning competitors, this takes about 30-60 seconds';
+
+  fetch('/runs', {{ method: 'POST' }})
+    .then(res => res.json())
+    .then(data => {{
+      setTimeout(() => {{
+        text.innerHTML = 'Run complete — reloading dashboard';
+        setTimeout(() => location.reload(), 1500);
+      }}, 45000);
+    }})
+    .catch(err => {{
+      btn.disabled = false;
+      btn.textContent = 'RUN NOW';
+      btn.style.opacity = '1';
+      text.innerHTML = 'Something went wrong — try again';
+    }});
+}}
+</script>
 </body>
 </html>
 """
