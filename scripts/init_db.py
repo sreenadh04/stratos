@@ -1,88 +1,72 @@
+# scripts/init_db.py
+"""
+Initialize the database schema.
+Creates all tables defined in SQLAlchemy models.
+"""
 import os
-import psycopg2
+import asyncio
 from dotenv import load_dotenv
+from sqlalchemy.ext.asyncio import create_async_engine
+from stratos.db.models import Base
 
-def init_db():
+
+def clean_database_url(url: str) -> str:
+    """Remove sslmode parameter from database URL if present."""
+    if "sslmode=" in url:
+        parts = url.split("?")
+        if len(parts) > 1:
+            params = [p for p in parts[1].split("&") if not p.startswith("sslmode=")]
+            return parts[0] + ("?" + "&".join(params) if params else "")
+    return url
+
+
+async def init_db():
+    """Initialize database with all tables."""
     load_dotenv()
     database_url = os.getenv("DATABASE_URL")
     
     if not database_url:
-        print("Error: DATABASE_URL not found in .env")
-        return
-
+        print("❌ Error: DATABASE_URL not found in .env")
+        return False
+    
+    # Clean and convert to async URL
+    cleaned_url = clean_database_url(database_url)
+    async_url = cleaned_url.replace("postgresql://", "postgresql+asyncpg://")
+    
     try:
-        conn = psycopg2.connect(database_url)
-        cur = conn.cursor()
-
-        # Create Competitor table
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS competitors (
-                id UUID PRIMARY KEY,
-                name VARCHAR(255) NOT NULL,
-                website_url VARCHAR(500) NOT NULL,
-                blog_url VARCHAR(500) NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        """)
-        print("Table 'competitors' created successfully.")
-
-        # Create Run table
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS runs (
-                id UUID PRIMARY KEY,
-                status VARCHAR(50) DEFAULT 'pending',
-                trigger_type VARCHAR(50) DEFAULT 'scheduled',
-                started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                completed_at TIMESTAMP,
-                signal_count INTEGER DEFAULT 0,
-                error_message TEXT,
-                langsmith_run_id VARCHAR(255)
-            );
-        """)
-        print("Table 'runs' created successfully.")
-
-        # Create RawSnapshot table
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS raw_snapshots (
-                id UUID PRIMARY KEY,
-                competitor_id UUID NOT NULL REFERENCES competitors(id),
-                run_id UUID NOT NULL REFERENCES runs(id),
-                source_url VARCHAR(500) NOT NULL,
-                content_hash VARCHAR(64) NOT NULL,
-                raw_content TEXT NOT NULL,
-                captured_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        """)
-        print("Table 'raw_snapshots' created successfully.")
-
-        # Create Signal table
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS signals (
-                id UUID PRIMARY KEY,
-                run_id UUID NOT NULL REFERENCES runs(id),
-                competitor_id UUID NOT NULL REFERENCES competitors(id),
-                raw_snapshot_id UUID REFERENCES raw_snapshots(id),
-                impact_level VARCHAR(10),
-                summary TEXT,
-                evidence TEXT,
-                hypothesis TEXT,
-                recommendation TEXT,
-                confidence FLOAT,
-                is_duplicate BOOLEAN DEFAULT FALSE,
-                evaluated_accurate BOOLEAN,
-                evaluator_note TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        """)
-        print("Table 'signals' created successfully.")
-
-        conn.commit()
-        cur.close()
-        conn.close()
-        print("Database initialization complete.")
-
+        # Create engine
+        engine = create_async_engine(async_url, echo=True)
+        
+        # Create all tables
+        async with engine.begin() as conn:
+            print("📋 Creating tables...")
+            await conn.run_sync(Base.metadata.create_all)
+            print("✅ Tables created successfully")
+        
+        await engine.dispose()
+        return True
+        
     except Exception as e:
-        print(f"An error occurred: {e}")
+        print(f"❌ Database initialization failed: {e}")
+        return False
+
+
+async def main():
+    print("=" * 50)
+    print("  StratOS - Database Initialization")
+    print("=" * 50)
+    
+    success = await init_db()
+    
+    if success:
+        print("\n✅ Database initialization complete.")
+        print("📋 Next steps:")
+        print("  1. Run: python scripts/seed_competitors.py")
+        print("  2. Start the API: uvicorn stratos.api.main:app --reload")
+    else:
+        print("\n❌ Database initialization failed. Check your DATABASE_URL.")
+        print("   Make sure PostgreSQL is running and accessible.")
+
 
 if __name__ == "__main__":
-    init_db()
+    asyncio.run(main())

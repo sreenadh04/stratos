@@ -1,13 +1,18 @@
+# stratos/agents/strategist.py
 import uuid
 import datetime
 import json
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import os
-from groq import Groq
 from stratos.config import settings
+from stratos.llm.factory import LLMFactory
+from stratos.db.session import get_db_session_manual
+from stratos.db.repositories import SignalRepository, CompetitorRepository
+from stratos.logging_config import get_logger
 
-client = Groq(api_key=settings.groq_api_key)
+# Create logger
+logger = get_logger("strategist")
 
 STRATEGIST_PROMPT = """
 You are a senior product strategist and competitive intelligence expert.
@@ -39,145 +44,134 @@ Rules:
 - LOW/NEUTRAL: worth monitoring but not urgent
 """
 
-def run_strategist(signals: list[dict], run_id: str, db_url: str) -> list[dict]:
+
+async def run_strategist(signals: list[dict], run_id: str) -> list[dict]:
+    """Generate strategic assessments using the configured LLM provider."""
     results = []
-    conn = None
+    
+    # Get LLM provider (from config)
+    llm = LLMFactory.get_provider()
+    logger.info(f"🧠 Using LLM provider: {llm.get_provider_name()}", extra={"run_id": run_id})
     
     try:
-        conn = psycopg2.connect(db_url)
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        
-        # Query all competitors into a dict
-        cur.execute("SELECT id, name FROM competitors;")
-        competitor_names = {str(r["id"]): r["name"] for r in cur.fetchall()}
-        
-        # Group signals by competitor_id
-        competitor_groups = {}
-        for s in signals:
-            comp_id = str(s['competitor_id'])
-            if comp_id not in competitor_groups:
-                competitor_groups[comp_id] = []
-            competitor_groups[comp_id].append(s)
+        async with get_db_session_manual() as session:
+            signal_repo = SignalRepository(session)
+            competitor_repo = CompetitorRepository(session)
             
-        for comp_id, group in competitor_groups.items():
-            try:
-                # Skip if all signals in the group are duplicates
-                if all(s.get('is_duplicate', False) for s in group):
+            # Get competitor names
+            competitor_names = await competitor_repo.get_name_mapping()
+            
+            # Group signals by competitor_id
+            competitor_groups = {}
+            for s in signals:
+                comp_id = str(s['competitor_id'])
+                if comp_id not in competitor_groups:
+                    competitor_groups[comp_id] = []
+                competitor_groups[comp_id].append(s)
+                
+            for comp_id, group in competitor_groups.items():
+                try:
+                    # Skip if all signals in the group are duplicates
+                    if all(s.get('is_duplicate', False) for s in group):
+                        continue
+                    
+                    competitor_name = competitor_names.get(str(comp_id), "Unknown")
+                    logger.info(f"Assessing {competitor_name}...", extra={"run_id": run_id, "competitor": competitor_name})
+                    
+                    # Build signals text
+                    signals_text = ""
+                    for i, s in enumerate(group):
+                        signals_text += f"{i+1}. Summary: {s['summary']}\n   Evidence: {s['evidence']}\n\n"
+                    
+                    # Build prompt
+                    prompt = STRATEGIST_PROMPT.format(
+                        competitor_name=competitor_name,
+                        signals_text=signals_text,
+                        product_context=settings.product_context
+                    )
+                    
+                    # Call LLM (provider-agnostic)
+                    response_text = await llm.generate(
+                        prompt=prompt,
+                        response_format="json",
+                        temperature=0.4,
+                        max_tokens=600
+                    )
+                    
+                    # Parse JSON
+                    assessment = json.loads(response_text.strip())
+                    
+                    hypothesis = assessment.get("hypothesis", "")
+                    recommendation = assessment.get("recommendation", "")
+                    threat_level = assessment.get("threat_level", "NEUTRAL")
+                    
+                    # Update all signals for this competitor in this run
+                    await signal_repo.update_strategy(
+                        competitor_id=comp_id,
+                        run_id=run_id,
+                        hypothesis=hypothesis,
+                        recommendation=recommendation
+                    )
+                    
+                    await session.commit()
+                    
+                    logger.info(f"  ✅ {competitor_name} -> threat={threat_level}", 
+                               extra={"run_id": run_id, "competitor": competitor_name})
+                    
+                    results.append({
+                        "competitor_id": comp_id,
+                        "competitor_name": competitor_name,
+                        "threat_level": threat_level,
+                        "hypothesis": hypothesis,
+                        "recommendation": recommendation
+                    })
+                    
+                except json.JSONDecodeError as e:
+                    logger.error(f"  ❌ JSON parse error for {comp_id}: {e}", 
+                                extra={"run_id": run_id, "competitor": competitor_names.get(str(comp_id), "Unknown")})
                     continue
-                
-                competitor_name = competitor_names.get(str(comp_id), "Unknown")
-                print(f"Assessing {competitor_name}...")
-                
-                # Build signals text
-                signals_text = ""
-                for i, s in enumerate(group):
-                    signals_text += f"{i+1}. Summary: {s['summary']}\n   Evidence: {s['evidence']}\n\n"
-                
-                # Build prompt
-                prompt = STRATEGIST_PROMPT.format(
-                    competitor_name=competitor_name,
-                    signals_text=signals_text,
-                    product_context=settings.product_context
-                )
-                
-                # Call Groq
-                response = client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
-                    messages=[{"role": "user", "content": prompt}]
-                )
-                response_text = response.choices[0].message.content
-                
-                # Parse JSON
-                raw_text = response_text.strip()
-                if raw_text.startswith("```json"):
-                    raw_text = raw_text.replace("```json", "", 1)
-                if raw_text.endswith("```"):
-                    raw_text = raw_text[:-3]
-                
-                assessment = json.loads(raw_text.strip())
-                hypothesis = assessment.get("hypothesis", "")
-                recommendation = assessment.get("recommendation", "")
-                threat_level = assessment.get("threat_level", "NEUTRAL")
-                
-                # Update all signals for this competitor in this run
-                cur.execute("""
-                    UPDATE signals 
-                    SET hypothesis = %s, recommendation = %s
-                    WHERE competitor_id = %s AND run_id = %s;
-                """, (hypothesis, recommendation, comp_id, run_id))
-                
-                print(f"Strategist: {competitor_name} -> threat={threat_level}")
-                
-                results.append({
-                    "competitor_id": comp_id,
-                    "competitor_name": competitor_name,
-                    "threat_level": threat_level,
-                    "hypothesis": hypothesis,
-                    "recommendation": recommendation
-                })
-                
-            except Exception as e:
-                print(f"  Error assessing {comp_id}: {e}")
-                continue
-                
-        conn.commit()
-        cur.close()
-        
+                except Exception as e:
+                    logger.error(f"  ❌ Error assessing {comp_id}: {e}", 
+                                extra={"run_id": run_id, "competitor": competitor_names.get(str(comp_id), "Unknown")}, 
+                                exc_info=True)
+                    continue
+                    
     except Exception as e:
-        print(f"Database error in run_strategist: {e}")
-    finally:
-        if conn:
-            conn.close()
+        logger.error(f"Database error in run_strategist: {e}", extra={"run_id": run_id}, exc_info=True)
             
     return results
 
+
 if __name__ == "__main__":
-    import os
+    import asyncio
     from dotenv import load_dotenv
     load_dotenv()
     
-    db_url = os.getenv("DATABASE_URL")
+    async def test():
+        db_url = os.getenv("DATABASE_URL")
+        
+        try:
+            async with get_db_session_manual() as session:
+                from stratos.db.repositories import RunRepository
+                run_repo = RunRepository(session)
+                
+                # Get most recent run
+                runs = await run_repo.get_latest(1)
+                if not runs:
+                    logger.info("No runs found.")
+                    return
+                    
+                run_id = str(runs[0].id)
+                
+                # Get signals for this run (non-duplicates)
+                signal_repo = SignalRepository(session)
+                signals = await signal_repo.get_by_run_with_competitor(run_id)
+                
+                logger.info(f"Found {len(signals)} unique signals for run {run_id}")
+                results = await run_strategist(signals, run_id)
+                logger.info(f"Strategist complete. Assessed {len(results)} competitors")
+                
+        except Exception as e:
+            logger.error(f"Test failed: {e}")
     
-    try:
-        conn = psycopg2.connect(db_url)
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        
-        # Get most recent run
-        cur.execute("SELECT id FROM runs ORDER BY started_at DESC LIMIT 1;")
-        run_row = cur.fetchone()
-        
-        if not run_row:
-            print("No runs found.")
-            exit(1)
-            
-        run_id = str(run_row["id"])
-        
-        # Get signals for this run (non-duplicates)
-        cur.execute("""
-            SELECT s.competitor_id, s.summary, s.evidence, c.name, s.is_duplicate
-            FROM signals s
-            JOIN competitors c ON s.competitor_id = c.id
-            WHERE s.run_id = %s AND s.is_duplicate = false;
-        """, (run_id,))
-        
-        signal_rows = cur.fetchall()
-        signals = [
-            {
-                "competitor_id": str(r["competitor_id"]),
-                "summary": r["summary"],
-                "evidence": r["evidence"],
-                "competitor_name": r["name"],
-                "is_duplicate": r["is_duplicate"]
-            }
-            for r in signal_rows
-        ]
-        
-        print(f"Found {len(signals)} unique signals for run {run_id}")
-        results = run_strategist(signals, run_id, db_url)
-        print(f"Strategist complete. Assessed {len(results)} competitors")
-        
-        cur.close()
-        conn.close()
-        
-    except Exception as e:
-        print(f"Test failed: {e}")
+    asyncio.run(test())

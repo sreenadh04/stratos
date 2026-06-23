@@ -1,15 +1,18 @@
+# stratos/agents/analyst.py
 import uuid
 import datetime
 import json
-import psycopg2
-import os
 import re
-from groq import Groq
 from stratos.config import settings
 from stratos.memory.embeddings import embed_text
 from stratos.memory.vector_store import QdrantStore
+from stratos.llm.factory import LLMFactory
+from stratos.db.session import get_db_session_manual
+from stratos.db.repositories import SignalRepository
+from stratos.logging_config import get_logger
 
-client = Groq(api_key=settings.groq_api_key)
+# Create logger
+logger = get_logger("analyst")
 
 ANALYST_PROMPT = """
 You are a competitive intelligence analyst. Analyze the following content from a competitor's blog/website and extract the most important strategic signal.
@@ -33,171 +36,151 @@ Rules:
 - Be specific, not generic. Reference actual content.
 """
 
-def run_analyst(snapshots: list[dict], run_id: str, db_url: str) -> list[dict]:
+
+async def run_analyst(snapshots: list[dict], run_id: str) -> list[dict]:
+    """Analyze snapshots using the configured LLM provider."""
     results = []
     store = QdrantStore()
-    conn = None
+    
+    # Get LLM provider (from config)
+    llm = LLMFactory.get_provider()
+    logger.info(f"🔍 Using LLM provider: {llm.get_provider_name()}", extra={"run_id": run_id})
     
     try:
-        conn = psycopg2.connect(db_url)
-        cur = conn.cursor()
-        
-        for snapshot in snapshots:
-            try:
-                print(f"Analyzing {snapshot['competitor_name']}...")
-                
-                # Build prompt
-                content_preview = snapshot['content'][:3000]
-                prompt = ANALYST_PROMPT.format(
-                    competitor_name=snapshot['competitor_name'],
-                    content=content_preview,
-                    product_context=settings.product_context
-                )
-                
-                # Call Groq
-                response = client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
-                    messages=[{"role": "user", "content": prompt}]
-                )
-                response_text = response.choices[0].message.content
-                
-                # Parse JSON
-                raw_text = response_text.strip()
-                if raw_text.startswith("```json"):
-                    raw_text = raw_text.replace("```json", "", 1)
-                if raw_text.endswith("```"):
-                    raw_text = raw_text[:-3]
-                
+        async with get_db_session_manual() as session:
+            signal_repo = SignalRepository(session)
+            
+            for snapshot in snapshots:
                 try:
-                    # Robust parsing: try to find JSON object using regex
-                    match = re.search(r'\{.*\}', raw_text, re.DOTALL)
-                    if match:
-                        raw_text = match.group(0)
-                    analysis = json.loads(raw_text.strip())
-                except Exception as parse_error:
-                    print(f"  JSON parse error for {snapshot['competitor_name']}: {parse_error}")
-                    analysis = {
-                        "summary": "Analysis unavailable", 
-                        "impact_level": "LOW", 
-                        "evidence": "Parse error", 
-                        "confidence": 0.5
-                    }
-
-                summary = analysis.get("summary", "")
-                impact_level = analysis.get("impact_level", "LOW")
-                evidence = analysis.get("evidence", "")
-                confidence = analysis.get("confidence", 0.0)
-                
-                # Check for duplicates
-                is_duplicate = False
-                embedding = embed_text(summary)
-                
-                if embedding:
-                    similar = store.search_similar(embedding, snapshot['competitor_id'])
-                    for hit in similar:
-                        if hit['score'] > 0.98:
-                            is_duplicate = True
-                            print("  Duplicate signal skipped")
-                            break
+                    competitor_name = snapshot.get('competitor_name', 'Unknown')
+                    logger.info(f"Analyzing {competitor_name}...", extra={"run_id": run_id, "competitor": competitor_name})
                     
-                    if not is_duplicate:
-                        store.upsert_signal(
-                            signal_id=str(uuid.uuid4()),
-                            vector=embedding,
-                            payload={
-                                "competitor_id": snapshot['competitor_id'],
-                                "summary": summary,
-                                "impact_level": impact_level
-                            }
-                        )
-                
-                # Save to DB
-                signal_id = str(uuid.uuid4())
-                cur.execute("""
-                    INSERT INTO signals (
-                        id, run_id, competitor_id, raw_snapshot_id, 
-                        impact_level, summary, evidence, confidence, 
-                        is_duplicate, created_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    signal_id, run_id, snapshot['competitor_id'], snapshot['snapshot_id'],
-                    impact_level, summary, evidence, confidence,
-                    is_duplicate, datetime.datetime.utcnow()
-                ))
-                
-                results.append({
-                    "signal_id": signal_id,
-                    "competitor_id": snapshot['competitor_id'],
-                    "competitor_name": snapshot.get("competitor_name", "Unknown"),
-                    "summary": summary,
-                    "evidence": evidence,
-                    "impact_level": impact_level,
-                    "is_duplicate": is_duplicate
-                })
-                
-                print(f"  Impact: {impact_level} | {summary[:80]}")
-                
-            except Exception as e:
-                print(f"  Error analyzing snapshot for {snapshot.get('competitor_name')}: {e}")
-                continue
-                
-        conn.commit()
-        cur.close()
-        
+                    # Build prompt
+                    content_preview = snapshot['content'][:3000]
+                    prompt = ANALYST_PROMPT.format(
+                        competitor_name=competitor_name,
+                        content=content_preview,
+                        product_context=settings.product_context
+                    )
+                    
+                    # Call LLM (provider-agnostic)
+                    response_text = await llm.generate(
+                        prompt=prompt,
+                        response_format="json",
+                        temperature=0.3,
+                        max_tokens=500
+                    )
+                    
+                    # Parse JSON
+                    try:
+                        analysis = json.loads(response_text.strip())
+                    except json.JSONDecodeError:
+                        match = re.search(r'\{.*\}', response_text, re.DOTALL)
+                        if match:
+                            analysis = json.loads(match.group(0))
+                        else:
+                            raise ValueError("No JSON found in response")
+                    
+                    summary = analysis.get("summary", "")
+                    impact_level = analysis.get("impact_level", "LOW")
+                    evidence = analysis.get("evidence", "")
+                    confidence = analysis.get("confidence", 0.0)
+                    
+                    # Check for duplicates using vector search
+                    is_duplicate = False
+                    embedding = embed_text(summary)
+                    
+                    if embedding:
+                        similar = store.search_similar(embedding, snapshot['competitor_id'])
+                        for hit in similar:
+                            if hit['score'] > 0.98:
+                                is_duplicate = True
+                                logger.info(f"  ⚠️ Duplicate signal skipped (score: {hit['score']:.3f})", 
+                                           extra={"run_id": run_id, "competitor": competitor_name})
+                                break
+                        
+                        if not is_duplicate:
+                            store.upsert_signal(
+                                signal_id=str(uuid.uuid4()),
+                                vector=embedding,
+                                payload={
+                                    "competitor_id": snapshot['competitor_id'],
+                                    "summary": summary,
+                                    "impact_level": impact_level
+                                }
+                            )
+                    
+                    # Save to DB using repository
+                    raw_snapshot_id = snapshot.get('snapshot_id', None)
+                    
+                    signal = await signal_repo.create(
+                        run_id=run_id,
+                        competitor_id=snapshot['competitor_id'],
+                        raw_snapshot_id=raw_snapshot_id,
+                        impact_level=impact_level,
+                        summary=summary,
+                        evidence=evidence,
+                        confidence=confidence,
+                        is_duplicate=is_duplicate
+                    )
+                    
+                    await session.commit()
+                    
+                    results.append({
+                        "signal_id": str(signal.id),
+                        "competitor_id": snapshot['competitor_id'],
+                        "competitor_name": competitor_name,
+                        "summary": summary,
+                        "evidence": evidence,
+                        "impact_level": impact_level,
+                        "is_duplicate": is_duplicate
+                    })
+                    
+                    logger.info(f"  ✅ Impact: {impact_level} | {summary[:80]}...", 
+                               extra={"run_id": run_id, "competitor": competitor_name})
+                    
+                except Exception as e:
+                    logger.error(f"  ❌ Error analyzing snapshot: {e}", 
+                                extra={"run_id": run_id, "competitor": snapshot.get('competitor_name', 'Unknown')}, 
+                                exc_info=True)
+                    await session.rollback()
+                    continue
+                    
     except Exception as e:
-        print(f"Database error in run_analyst: {e}")
-    finally:
-        if conn:
-            conn.close()
+        logger.error(f"Database error in run_analyst: {e}", extra={"run_id": run_id}, exc_info=True)
             
     return results
 
+
 if __name__ == "__main__":
+    import asyncio
     import os
     from dotenv import load_dotenv
     load_dotenv()
     
-    db_url = os.getenv("DATABASE_URL")
+    async def test():
+        try:
+            async with get_db_session_manual() as session:
+                from stratos.db.repositories import RunRepository, RawSnapshotRepository
+                run_repo = RunRepository(session)
+                
+                # Get most recent run
+                runs = await run_repo.get_latest(1)
+                if not runs:
+                    logger.info("No runs found. Run scout test first.")
+                    return
+                    
+                run_id = str(runs[0].id)
+                
+                # Get snapshots for this run
+                snapshot_repo = RawSnapshotRepository(session)
+                snapshots = await snapshot_repo.get_by_run_with_content(run_id)
+                
+                logger.info(f"Found {len(snapshots)} snapshots for run {run_id}")
+                results = await run_analyst(snapshots, run_id)
+                logger.info(f"Analyst complete. Scored {len(results)} signals")
+                
+        except Exception as e:
+            logger.error(f"Test failed: {e}")
     
-    try:
-        conn = psycopg2.connect(db_url)
-        cur = conn.cursor()
-        
-        # Get most recent run
-        cur.execute("SELECT id FROM runs ORDER BY started_at DESC LIMIT 1;")
-        run_row = cur.fetchone()
-        
-        if not run_row:
-            print("No runs found. Run scout test first.")
-            exit(1)
-            
-        run_id = run_row[0]
-        
-        # Get snapshots for this run
-        cur.execute("""
-            SELECT s.id, s.competitor_id, s.raw_content, c.name 
-            FROM raw_snapshots s
-            JOIN competitors c ON s.competitor_id = c.id
-            WHERE s.run_id = %s;
-        """, (run_id,))
-        
-        snapshot_rows = cur.fetchall()
-        snapshots = [
-            {
-                "snapshot_id": r[0],
-                "competitor_id": r[1],
-                "content": r[2],
-                "competitor_name": r[3]
-            }
-            for r in snapshot_rows
-        ]
-        
-        print(f"Found {len(snapshots)} snapshots for run {run_id}")
-        results = run_analyst(snapshots, run_id, db_url)
-        print(f"Analyst complete. Scored {len(results)} signals")
-        
-        cur.close()
-        conn.close()
-        
-    except Exception as e:
-        print(f"Test failed: {e}")
+    asyncio.run(test())

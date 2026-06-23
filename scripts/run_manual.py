@@ -1,5 +1,10 @@
+# scripts/run_manual.py
+"""
+Manually trigger the StratOS pipeline from the command line.
+"""
 import os
 import sys
+import asyncio
 from dotenv import load_dotenv
 
 # Add parent directory to sys.path so stratos module is found
@@ -7,12 +12,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from stratos.agents.orchestrator import run_pipeline
 
-def main():
+
+async def main():
     load_dotenv()
     db_url = os.getenv("DATABASE_URL")
     
     if not db_url:
-        print("Error: DATABASE_URL not found in .env")
+        print("❌ Error: DATABASE_URL not found in .env")
         sys.exit(1)
 
     print("=" * 50)
@@ -21,7 +27,7 @@ def main():
     print("Starting intelligence run...")
 
     try:
-        run_id = run_pipeline(db_url)
+        run_id = await run_pipeline("manual")
         if run_id:
             print("\n" + "=" * 50)
             print(f"✅ Pipeline complete! Run ID: {run_id}")
@@ -33,5 +39,6 @@ def main():
         print(f"\n❌ An error occurred during the run: {e}")
         sys.exit(1)
 
+
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
