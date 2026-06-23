@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     langsmith_api_key: str = ""
     langchain_tracing_v2: str = "false"
     product_context: str = "StratOS is a competitive intelligence tool for founders and product teams."
+    database_url: str
     
     # LLM provider selection
     llm_provider: str = "groq"  # Options: "groq", "gemini"

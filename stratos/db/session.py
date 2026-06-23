@@ -6,17 +6,18 @@ Provides connection pooling and session lifecycle management.
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from typing import AsyncGenerator
 from stratos.config import settings
+import os
 
 
 def get_async_database_url():
-    """Convert sync database URL to async URL, removing sslmode if present."""
+    """Convert sync database URL to async URL."""
     url = settings.database_url
     
     # Convert to async
     if "postgresql://" in url:
         url = url.replace("postgresql://", "postgresql+asyncpg://")
     
-    # Remove sslmode parameter if present (asyncpg doesn't support it the same way)
+    # Remove sslmode if present
     if "sslmode=" in url:
         parts = url.split("?")
         if len(parts) > 1:
@@ -34,7 +35,12 @@ engine = create_async_engine(
     max_overflow=10,
     pool_pre_ping=True,
     pool_recycle=3600,
-    pool_use_lifo=True,  # Use LIFO to reduce connection churn
+    pool_use_lifo=True,
+    connect_args={
+        "server_settings": {
+            "application_name": "stratos",
+        }
+    }
 )
 
 # Create async session factory
