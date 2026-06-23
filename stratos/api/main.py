@@ -1,10 +1,8 @@
 # stratos/api/main.py
 """
 StratOS API - FastAPI application.
-Now fully async with proper database session management.
 """
 import datetime
-import os
 import uuid
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Depends
 from fastapi.responses import HTMLResponse
@@ -22,7 +20,7 @@ from stratos.db.repositories import (
 from stratos.scheduler.job import Scheduler
 from stratos.eval.metrics import SignalEvaluator
 from stratos.logging_config import get_logger
-from stratos.api.auth import validate_api_key, optional_api_key, get_rate_limit_key
+from stratos.api.auth import validate_api_key
 
 # Create logger
 logger = get_logger("api")
@@ -73,16 +71,9 @@ async def trigger_run(
     background_tasks: BackgroundTasks,
     api_key: str = Depends(validate_api_key)
 ):
-    """
-    Trigger a new intelligence pipeline run.
-    Runs in the background and delivers results to Slack.
-    """
-    # Generate run ID for tracking
+    """Trigger a new intelligence pipeline run."""
     run_id = str(uuid.uuid4())
-    
-    # Add to background tasks
     background_tasks.add_task(run_pipeline, "manual")
-    
     return {
         "message": "Run started",
         "run_id": run_id,
@@ -100,7 +91,6 @@ async def get_runs(
     try:
         run_repo = RunRepository(db)
         runs = await run_repo.get_latest(10)
-        
         return [
             {
                 "id": str(run.id),
@@ -126,7 +116,6 @@ async def get_run_signals(
     try:
         signal_repo = SignalRepository(db)
         signals = await signal_repo.get_by_run_with_competitor(run_id)
-        
         return signals
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -148,12 +137,9 @@ async def evaluate_signal(
             eval_data.accurate,
             eval_data.note
         )
-        
         if not success:
             raise HTTPException(status_code=404, detail="Signal not found")
-        
         return {"message": "Evaluation saved successfully"}
-        
     except HTTPException:
         raise
     except Exception as e:
@@ -220,45 +206,49 @@ async def get_stats(
 
 
 # Dashboard - PUBLIC (HTML only)
-# Dashboard - PUBLIC (HTML only)
 @app.get("/", response_class=HTMLResponse)
 async def get_dashboard(db: AsyncSession = Depends(get_db_session)):
     """Live HTML dashboard showing current state."""
     try:
-        # Get repositories
         run_repo = RunRepository(db)
         signal_repo = SignalRepository(db)
         competitor_repo = CompetitorRepository(db)
         
-        # Get latest runs
-        runs = await run_repo.get_latest(20)
+        # Safely get runs
+        runs = []
+        try:
+            runs = await run_repo.get_latest(20)
+        except Exception as e:
+            logger.error(f"Could not fetch runs: {e}")
+            runs = []
+        
         last_run = runs[0] if runs else None
         
-        # Get counts
-        total_signals = await signal_repo.get_count()
-        high_signals = await signal_repo.get_high_impact_count()
+        # Safely get counts
+        total_signals = 0
+        high_signals = 0
+        try:
+            total_signals = await signal_repo.get_count()
+            high_signals = await signal_repo.get_high_impact_count()
+        except Exception as e:
+            logger.error(f"Could not fetch signal counts: {e}")
         
-        # Get competitors
-        competitors = await competitor_repo.get_all()
-        
-        # Get all signals for charts
-        all_signals = []
-        for run in runs[:5]:
-            signals = await signal_repo.get_by_run_with_competitor(str(run.id))
-            for s in signals:
-                all_signals.append({
-                    "competitor": s.get("competitor_name"),
-                    "impact_level": s.get("impact_level"),
-                    "created_at": run.started_at.isoformat() if run.started_at else None,
-                    "summary": s.get("summary", ""),
-                    "recommendation": s.get("recommendation", ""),
-                })
+        # Safely get competitors
+        competitors = []
+        try:
+            competitors = await competitor_repo.get_all()
+        except Exception as e:
+            logger.error(f"Could not fetch competitors: {e}")
+            competitors = []
         
         # Build competitor cards
         competitor_cards = ""
         for comp in competitors:
-            signals = await signal_repo.get_latest_for_competitor(str(comp.id), 1)
-            level = signals[0].impact_level if signals and signals[0].impact_level else "LOW"
+            try:
+                signals = await signal_repo.get_latest_for_competitor(str(comp.id), 1)
+                level = signals[0].impact_level if signals and signals[0].impact_level else "LOW"
+            except:
+                level = "LOW"
             
             level_class = level.lower() if level in ("HIGH", "MEDIUM", "LOW") else "low"
             dot_class = "high" if level == "HIGH" else ""
@@ -281,16 +271,14 @@ async def get_dashboard(db: AsyncSession = Depends(get_db_session)):
             </div>
             '''
         
-        # Build signal feed
-        signal_run = None
-        for run in runs:
-            sigs = await signal_repo.get_by_run_with_competitor(str(run.id))
-            if sigs:
-                signal_run = run
-                signals = sigs
-                break
-        if not signal_run:
-            signals = []
+        # Safely get signals for the feed
+        signals = []
+        if last_run:
+            try:
+                signals = await signal_repo.get_by_run_with_competitor(str(last_run.id))
+            except Exception as e:
+                logger.error(f"Could not fetch signals: {e}")
+                signals = []
         latest_signals = signals[:10] if signals else []
         
         signal_html = ""
@@ -352,23 +340,20 @@ async def get_dashboard(db: AsyncSession = Depends(get_db_session)):
             </div>
             '''
         
-        # Build chart data
-        chart_data = {
-            "labels": [f"Run {i+1}" for i in range(min(5, len(runs)))],
-            "signals": [r.signal_count or 0 for r in runs[:5]],
-            "competitors": [c.name for c in competitors],
-            "threat_levels": [0, 0, 0]  # HIGH, MEDIUM, LOW
-        }
+        # Chart data
+        chart_labels = [f"Run {i+1}" for i in range(min(5, len(runs)))]
+        chart_signals = [r.signal_count or 0 for r in runs[:5]]
         
-        # Count threat levels
-        for s in all_signals:
-            if s.get("impact_level") == "HIGH":
-                chart_data["threat_levels"][0] += 1
-            elif s.get("impact_level") == "MEDIUM":
-                chart_data["threat_levels"][1] += 1
+        threat_counts = [0, 0, 0]
+        for s in signals:
+            level = s.get("impact_level")
+            if level == "HIGH":
+                threat_counts[0] += 1
+            elif level == "MEDIUM":
+                threat_counts[1] += 1
             else:
-                chart_data["threat_levels"][2] += 1
-        
+                threat_counts[2] += 1
+
         html_content = f'''
 <!DOCTYPE html>
 <html lang="en">
@@ -379,7 +364,6 @@ async def get_dashboard(db: AsyncSession = Depends(get_db_session)):
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
-        
         :root {{
             --bg-primary: #0B0D10;
             --bg-secondary: #13161A;
@@ -398,29 +382,22 @@ async def get_dashboard(db: AsyncSession = Depends(get_db_session)):
             --shadow: 0 4px 24px rgba(0,0,0,0.4);
             --radius: 12px;
         }}
-        
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        
         body {{
             background: var(--bg-primary);
             color: var(--text-primary);
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            font-family: 'Inter', sans-serif;
             line-height: 1.6;
             min-height: 100vh;
         }}
-        
         ::-webkit-scrollbar {{ width: 6px; height: 6px; }}
         ::-webkit-scrollbar-track {{ background: var(--bg-secondary); }}
         ::-webkit-scrollbar-thumb {{ background: var(--border-color); border-radius: 3px; }}
-        ::-webkit-scrollbar-thumb:hover {{ background: var(--text-muted); }}
-        
         .app {{
             max-width: 1400px;
             margin: 0 auto;
             padding: 24px 32px 60px;
         }}
-        
-        /* Header */
         .header {{
             display: flex;
             justify-content: space-between;
@@ -431,13 +408,11 @@ async def get_dashboard(db: AsyncSession = Depends(get_db_session)):
             flex-wrap: wrap;
             gap: 16px;
         }}
-        
         .logo {{
             display: flex;
             align-items: center;
             gap: 14px;
         }}
-        
         .logo-icon {{
             width: 40px;
             height: 40px;
@@ -448,7 +423,6 @@ async def get_dashboard(db: AsyncSession = Depends(get_db_session)):
             justify-content: center;
             position: relative;
         }}
-        
         .logo-icon::after {{
             content: '';
             width: 10px;
@@ -457,34 +431,14 @@ async def get_dashboard(db: AsyncSession = Depends(get_db_session)):
             border-radius: 50%;
             animation: pulse-ring 2.4s ease-out infinite;
         }}
-        
         @keyframes pulse-ring {{
             0% {{ box-shadow: 0 0 0 0 rgba(232,163,61,0.5); }}
             70% {{ box-shadow: 0 0 0 14px rgba(232,163,61,0); }}
             100% {{ box-shadow: 0 0 0 0 rgba(232,163,61,0); }}
         }}
-        
-        .logo-text h1 {{
-            font-size: 22px;
-            font-weight: 700;
-            letter-spacing: -0.02em;
-        }}
-        
-        .logo-text span {{
-            font-size: 12px;
-            color: var(--text-muted);
-            font-weight: 400;
-            letter-spacing: 0.06em;
-            text-transform: uppercase;
-            display: block;
-        }}
-        
-        .header-actions {{
-            display: flex;
-            align-items: center;
-            gap: 16px;
-        }}
-        
+        .logo-text h1 {{ font-size: 22px; font-weight: 700; letter-spacing: -0.02em; }}
+        .logo-text span {{ font-size: 12px; color: var(--text-muted); font-weight: 400; letter-spacing: 0.06em; text-transform: uppercase; display: block; }}
+        .header-actions {{ display: flex; align-items: center; gap: 16px; }}
         .status-pill {{
             display: flex;
             align-items: center;
@@ -497,7 +451,6 @@ async def get_dashboard(db: AsyncSession = Depends(get_db_session)):
             border-radius: 100px;
             font-weight: 500;
         }}
-        
         .status-pill .dot {{
             width: 6px;
             height: 6px;
@@ -505,12 +458,10 @@ async def get_dashboard(db: AsyncSession = Depends(get_db_session)):
             border-radius: 50%;
             animation: pulse-dot 1.8s ease-in-out infinite;
         }}
-        
         @keyframes pulse-dot {{
             0%, 100% {{ opacity: 1; }}
             50% {{ opacity: 0.3; }}
         }}
-        
         .btn-primary {{
             font-family: 'Inter', sans-serif;
             font-size: 13px;
@@ -526,26 +477,21 @@ async def get_dashboard(db: AsyncSession = Depends(get_db_session)):
             align-items: center;
             gap: 8px;
         }}
-        
         .btn-primary:hover {{
             transform: translateY(-1px);
             box-shadow: 0 4px 16px rgba(232,163,61,0.3);
         }}
-        
         .btn-primary:disabled {{
             opacity: 0.5;
             cursor: not-allowed;
             transform: none;
         }}
-        
-        /* Stats Grid */
         .stats-grid {{
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
             gap: 16px;
             margin-bottom: 32px;
         }}
-        
         .stat-card {{
             background: var(--bg-card);
             border: 1px solid var(--border-color);
@@ -553,59 +499,31 @@ async def get_dashboard(db: AsyncSession = Depends(get_db_session)):
             padding: 20px 24px;
             transition: all 0.2s ease;
         }}
-        
         .stat-card:hover {{
             background: var(--bg-card-hover);
             border-color: var(--text-muted);
         }}
-        
-        .stat-label {{
-            font-size: 12px;
-            font-weight: 500;
-            color: var(--text-muted);
-            text-transform: uppercase;
-            letter-spacing: 0.06em;
-        }}
-        
-        .stat-value {{
-            font-size: 32px;
-            font-weight: 700;
-            margin-top: 4px;
-            letter-spacing: -0.02em;
-        }}
-        
+        .stat-label {{ font-size: 12px; font-weight: 500; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.06em; }}
+        .stat-value {{ font-size: 32px; font-weight: 700; margin-top: 4px; letter-spacing: -0.02em; }}
         .stat-value.amber {{ color: var(--accent-amber); }}
         .stat-value.teal {{ color: var(--accent-teal); }}
         .stat-value.red {{ color: var(--accent-red); }}
-        
-        .stat-sub {{
-            font-size: 13px;
-            color: var(--text-secondary);
-            margin-top: 2px;
-        }}
-        
-        /* Main Grid */
+        .stat-sub {{ font-size: 13px; color: var(--text-secondary); margin-top: 2px; }}
         .main-grid {{
             display: grid;
             grid-template-columns: 1fr 360px;
             gap: 24px;
             margin-bottom: 32px;
         }}
-        
         @media (max-width: 1024px) {{
-            .main-grid {{
-                grid-template-columns: 1fr;
-            }}
+            .main-grid {{ grid-template-columns: 1fr; }}
         }}
-        
-        /* Cards */
         .card {{
             background: var(--bg-card);
             border: 1px solid var(--border-color);
             border-radius: var(--radius);
             overflow: hidden;
         }}
-        
         .card-header {{
             padding: 16px 24px;
             border-bottom: 1px solid var(--border-color);
@@ -613,38 +531,17 @@ async def get_dashboard(db: AsyncSession = Depends(get_db_session)):
             justify-content: space-between;
             align-items: center;
         }}
-        
-        .card-title {{
-            font-size: 15px;
-            font-weight: 600;
-        }}
-        
-        .card-badge {{
-            font-size: 11px;
-            color: var(--text-muted);
-            background: var(--bg-secondary);
-            padding: 2px 10px;
-            border-radius: 100px;
-            font-weight: 500;
-        }}
-        
-        .card-body {{
-            padding: 20px 24px;
-        }}
-        
-        /* Competitor Cards */
+        .card-title {{ font-size: 15px; font-weight: 600; }}
+        .card-badge {{ font-size: 11px; color: var(--text-muted); background: var(--bg-secondary); padding: 2px 10px; border-radius: 100px; font-weight: 500; }}
+        .card-body {{ padding: 20px 24px; }}
         .competitors-grid {{
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 12px;
         }}
-        
         @media (max-width: 600px) {{
-            .competitors-grid {{
-                grid-template-columns: 1fr;
-            }}
+            .competitors-grid {{ grid-template-columns: 1fr; }}
         }}
-        
         .competitor-card {{
             background: var(--bg-secondary);
             border: 1px solid var(--border-color);
@@ -652,17 +549,8 @@ async def get_dashboard(db: AsyncSession = Depends(get_db_session)):
             padding: 14px 16px;
             transition: all 0.2s ease;
         }}
-        
-        .competitor-card:hover {{
-            border-color: var(--text-muted);
-        }}
-        
-        .competitor-header {{
-            display: flex;
-            align-items: center;
-            gap: 12px;
-        }}
-        
+        .competitor-card:hover {{ border-color: var(--text-muted); }}
+        .competitor-header {{ display: flex; align-items: center; gap: 12px; }}
         .competitor-avatar {{
             width: 36px;
             height: 36px;
@@ -676,59 +564,17 @@ async def get_dashboard(db: AsyncSession = Depends(get_db_session)):
             color: var(--accent-amber);
             flex-shrink: 0;
         }}
-        
-        .competitor-info {{
-            flex: 1;
-            min-width: 0;
-        }}
-        
-        .competitor-name {{
-            font-size: 14px;
-            font-weight: 600;
-        }}
-        
-        .competitor-domain {{
-            font-size: 11px;
-            color: var(--text-muted);
-        }}
-        
-        .threat-badge {{
-            font-size: 10px;
-            font-weight: 700;
-            padding: 3px 10px;
-            border-radius: 4px;
-            letter-spacing: 0.04em;
-            flex-shrink: 0;
-        }}
-        
+        .competitor-info {{ flex: 1; min-width: 0; }}
+        .competitor-name {{ font-size: 14px; font-weight: 600; }}
+        .competitor-domain {{ font-size: 11px; color: var(--text-muted); }}
+        .threat-badge {{ font-size: 10px; font-weight: 700; padding: 3px 10px; border-radius: 4px; letter-spacing: 0.04em; flex-shrink: 0; }}
         .threat-badge.high {{ background: var(--accent-red-dim); color: #E8897A; }}
         .threat-badge.medium {{ background: var(--accent-amber-dim); color: var(--accent-amber); }}
         .threat-badge.low {{ background: var(--accent-teal-dim); color: #6FB8AE; }}
-        
-        .competitor-status {{
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            margin-top: 8px;
-            font-size: 11px;
-            color: var(--text-muted);
-        }}
-        
-        .status-dot {{
-            width: 6px;
-            height: 6px;
-            border-radius: 50%;
-            background: var(--accent-teal);
-        }}
-        
+        .competitor-status {{ display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 11px; color: var(--text-muted); }}
+        .status-dot {{ width: 6px; height: 6px; border-radius: 50%; background: var(--accent-teal); }}
         .status-dot.high {{ background: var(--accent-red); }}
-        
-        /* Signal Feed */
-        .signal-feed {{
-            max-height: 480px;
-            overflow-y: auto;
-        }}
-        
+        .signal-feed {{ max-height: 480px; overflow-y: auto; }}
         .signal-item {{
             display: flex;
             gap: 14px;
@@ -736,103 +582,31 @@ async def get_dashboard(db: AsyncSession = Depends(get_db_session)):
             border-bottom: 1px solid var(--border-color);
             transition: background 0.15s ease;
         }}
-        
-        .signal-item:hover {{
-            background: var(--bg-secondary);
-        }}
-        
-        .signal-item:last-child {{
-            border-bottom: none;
-        }}
-        
-        .signal-item.empty {{
-            color: var(--text-muted);
-            justify-content: center;
-            padding: 32px 16px;
-        }}
-        
-        .signal-icon {{
-            font-size: 20px;
-            flex-shrink: 0;
-            width: 28px;
-            text-align: center;
-        }}
-        
-        .signal-content {{
-            flex: 1;
-            min-width: 0;
-        }}
-        
-        .signal-header {{
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            flex-wrap: wrap;
-        }}
-        
-        .signal-company {{
-            font-size: 13px;
-            font-weight: 600;
-        }}
-        
-        .signal-badge {{
-            font-size: 9px;
-            font-weight: 700;
-            padding: 1px 10px;
-            border-radius: 100px;
-            letter-spacing: 0.04em;
-            text-transform: uppercase;
-        }}
-        
+        .signal-item:hover {{ background: var(--bg-secondary); }}
+        .signal-item:last-child {{ border-bottom: none; }}
+        .signal-item.empty {{ color: var(--text-muted); justify-content: center; padding: 32px 16px; }}
+        .signal-icon {{ font-size: 20px; flex-shrink: 0; width: 28px; text-align: center; }}
+        .signal-content {{ flex: 1; min-width: 0; }}
+        .signal-header {{ display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }}
+        .signal-company {{ font-size: 13px; font-weight: 600; }}
+        .signal-badge {{ font-size: 9px; font-weight: 700; padding: 1px 10px; border-radius: 100px; letter-spacing: 0.04em; text-transform: uppercase; }}
         .signal-badge.high {{ background: var(--accent-red-dim); color: #E8897A; }}
         .signal-badge.medium {{ background: var(--accent-amber-dim); color: var(--accent-amber); }}
         .signal-badge.low {{ background: var(--accent-teal-dim); color: #6FB8AE; }}
-        
-        .signal-summary {{
-            font-size: 13px;
-            color: var(--text-secondary);
-            margin-top: 2px;
-            line-height: 1.5;
-        }}
-        
-        .signal-recommendation {{
-            font-size: 12px;
-            color: var(--accent-amber);
-            margin-top: 6px;
-            display: flex;
-            align-items: center;
-            gap: 6px;
-        }}
-        
-        .signal-recommendation svg {{
-            flex-shrink: 0;
-        }}
-        
-        /* Charts */
+        .signal-summary {{ font-size: 13px; color: var(--text-secondary); margin-top: 2px; line-height: 1.5; }}
+        .signal-recommendation {{ font-size: 12px; color: var(--accent-amber); margin-top: 6px; display: flex; align-items: center; gap: 6px; }}
+        .signal-recommendation svg {{ flex-shrink: 0; }}
         .charts-grid {{
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 24px;
             margin-bottom: 32px;
         }}
-        
         @media (max-width: 768px) {{
-            .charts-grid {{
-                grid-template-columns: 1fr;
-            }}
+            .charts-grid {{ grid-template-columns: 1fr; }}
         }}
-        
-        .chart-container {{
-            position: relative;
-            height: 200px;
-        }}
-        
-        /* Run History */
-        .run-history {{
-            max-height: 300px;
-            overflow-y: auto;
-        }}
-        
+        .chart-container {{ position: relative; height: 200px; }}
+        .run-history {{ max-height: 300px; overflow-y: auto; }}
         .run-item {{
             display: flex;
             align-items: center;
@@ -841,38 +615,14 @@ async def get_dashboard(db: AsyncSession = Depends(get_db_session)):
             border-bottom: 1px solid var(--border-color);
             font-size: 13px;
         }}
-        
-        .run-item:last-child {{
-            border-bottom: none;
-        }}
-        
-        .run-status {{
-            font-size: 16px;
-        }}
-        
+        .run-item:last-child {{ border-bottom: none; }}
+        .run-status {{ font-size: 16px; }}
         .run-status.success {{ color: var(--accent-teal); }}
         .run-status.warning {{ color: var(--accent-amber); }}
         .run-status.error {{ color: var(--accent-red); }}
-        
-        .run-time {{
-            color: var(--text-muted);
-            font-size: 12px;
-            width: 44px;
-        }}
-        
-        .run-id {{
-            color: var(--text-secondary);
-            font-family: monospace;
-            font-size: 12px;
-        }}
-        
-        .run-signals {{
-            margin-left: auto;
-            color: var(--text-muted);
-            font-size: 12px;
-        }}
-        
-        /* Trigger Bar */
+        .run-time {{ color: var(--text-muted); font-size: 12px; width: 44px; }}
+        .run-id {{ color: var(--text-secondary); font-family: monospace; font-size: 12px; }}
+        .run-signals {{ margin-left: auto; color: var(--text-muted); font-size: 12px; }}
         .trigger-bar {{
             display: flex;
             justify-content: space-between;
@@ -885,18 +635,8 @@ async def get_dashboard(db: AsyncSession = Depends(get_db_session)):
             flex-wrap: wrap;
             gap: 12px;
         }}
-        
-        .trigger-text {{
-            font-size: 13px;
-            color: var(--text-secondary);
-        }}
-        
-        .trigger-text .mono {{
-            color: var(--text-muted);
-            font-family: monospace;
-        }}
-        
-        /* Footer */
+        .trigger-text {{ font-size: 13px; color: var(--text-secondary); }}
+        .trigger-text .mono {{ color: var(--text-muted); font-family: monospace; }}
         .footer {{
             display: flex;
             justify-content: space-between;
@@ -907,48 +647,20 @@ async def get_dashboard(db: AsyncSession = Depends(get_db_session)):
             flex-wrap: wrap;
             gap: 8px;
         }}
-        
-        .footer a {{
-            color: var(--text-secondary);
-            text-decoration: none;
-            transition: color 0.2s;
-        }}
-        
-        .footer a:hover {{
-            color: var(--text-primary);
-        }}
-        
-        /* Right Sidebar */
-        .sidebar {{
-            display: flex;
-            flex-direction: column;
-            gap: 24px;
-        }}
-        
-        /* Responsive */
+        .footer a {{ color: var(--text-secondary); text-decoration: none; transition: color 0.2s; }}
+        .footer a:hover {{ color: var(--text-primary); }}
+        .sidebar {{ display: flex; flex-direction: column; gap: 24px; }}
         @media (max-width: 600px) {{
-            .app {{
-                padding: 16px;
-            }}
-            .header {{
-                flex-direction: column;
-                align-items: stretch;
-            }}
-            .header-actions {{
-                flex-wrap: wrap;
-            }}
-            .stats-grid {{
-                grid-template-columns: 1fr 1fr;
-            }}
-            .stat-value {{
-                font-size: 24px;
-            }}
+            .app {{ padding: 16px; }}
+            .header {{ flex-direction: column; align-items: stretch; }}
+            .header-actions {{ flex-wrap: wrap; }}
+            .stats-grid {{ grid-template-columns: 1fr 1fr; }}
+            .stat-value {{ font-size: 24px; }}
         }}
     </style>
 </head>
 <body>
 <div class="app">
-    <!-- Header -->
     <header class="header">
         <div class="logo">
             <div class="logo-icon"></div>
@@ -971,7 +683,6 @@ async def get_dashboard(db: AsyncSession = Depends(get_db_session)):
         </div>
     </header>
     
-    <!-- Stats -->
     <div class="stats-grid">
         <div class="stat-card">
             <div class="stat-label">Competitors</div>
@@ -995,7 +706,6 @@ async def get_dashboard(db: AsyncSession = Depends(get_db_session)):
         </div>
     </div>
     
-    <!-- Charts -->
     <div class="charts-grid">
         <div class="card">
             <div class="card-header">
@@ -1011,7 +721,7 @@ async def get_dashboard(db: AsyncSession = Depends(get_db_session)):
         <div class="card">
             <div class="card-header">
                 <span class="card-title">🎯 Threat Distribution</span>
-                <span class="card-badge">{sum(chart_data["threat_levels"])} total</span>
+                <span class="card-badge">{sum(threat_counts)} total</span>
             </div>
             <div class="card-body">
                 <div class="chart-container">
@@ -1021,11 +731,8 @@ async def get_dashboard(db: AsyncSession = Depends(get_db_session)):
         </div>
     </div>
     
-    <!-- Main Grid -->
     <div class="main-grid">
-        <!-- Left Column -->
         <div>
-            <!-- Competitors -->
             <div class="card" style="margin-bottom:24px;">
                 <div class="card-header">
                     <span class="card-title">🏢 Competitors</span>
@@ -1037,8 +744,6 @@ async def get_dashboard(db: AsyncSession = Depends(get_db_session)):
                     </div>
                 </div>
             </div>
-            
-            <!-- Signal Feed -->
             <div class="card">
                 <div class="card-header">
                     <span class="card-title">📡 Latest Signals</span>
@@ -1051,10 +756,7 @@ async def get_dashboard(db: AsyncSession = Depends(get_db_session)):
                 </div>
             </div>
         </div>
-        
-        <!-- Right Sidebar -->
         <div class="sidebar">
-            <!-- Run History -->
             <div class="card">
                 <div class="card-header">
                     <span class="card-title">⏱️ Run History</span>
@@ -1066,8 +768,6 @@ async def get_dashboard(db: AsyncSession = Depends(get_db_session)):
                     </div>
                 </div>
             </div>
-            
-            <!-- Quick Stats -->
             <div class="card">
                 <div class="card-header">
                     <span class="card-title">📈 Quick Stats</span>
@@ -1096,7 +796,6 @@ async def get_dashboard(db: AsyncSession = Depends(get_db_session)):
         </div>
     </div>
     
-    <!-- Trigger Bar -->
     <div class="trigger-bar" id="trigger-bar">
         <div class="trigger-text" id="trigger-text">
             Run the pipeline manually — <span class="mono">POST /runs</span>
@@ -1104,7 +803,6 @@ async def get_dashboard(db: AsyncSession = Depends(get_db_session)):
         <span style="font-size:12px;color:var(--text-muted);">Last run: {last_run.started_at.strftime('%b %d, %H:%M') if last_run else 'Never'}</span>
     </div>
     
-    <!-- Footer -->
     <footer class="footer">
         <span>StratOS v1.0 — Autonomous Intelligence Pipeline</span>
         <a href="/docs" target="_blank">API Documentation →</a>
@@ -1112,17 +810,15 @@ async def get_dashboard(db: AsyncSession = Depends(get_db_session)):
 </div>
 
 <script>
-    // Chart.js initialization
     document.addEventListener('DOMContentLoaded', function() {{
-        // Signal Trends Chart
         const signalCtx = document.getElementById('signalChart').getContext('2d');
         new Chart(signalCtx, {{
             type: 'line',
             data: {{
-                labels: {chart_data["labels"]},
+                labels: {chart_labels},
                 datasets: [{{
                     label: 'Signals',
-                    data: {chart_data["signals"]},
+                    data: {chart_signals},
                     borderColor: '#E8A33D',
                     backgroundColor: 'rgba(232,163,61,0.1)',
                     fill: true,
@@ -1134,31 +830,21 @@ async def get_dashboard(db: AsyncSession = Depends(get_db_session)):
             options: {{
                 responsive: true,
                 maintainAspectRatio: false,
-                plugins: {{
-                    legend: {{ display: false }}
-                }},
+                plugins: {{ legend: {{ display: false }} }},
                 scales: {{
-                    y: {{
-                        beginAtZero: true,
-                        grid: {{ color: 'rgba(255,255,255,0.05)' }},
-                        ticks: {{ color: '#6A6E76' }}
-                    }},
-                    x: {{
-                        grid: {{ display: false }},
-                        ticks: {{ color: '#6A6E76', font: {{ size: 10 }} }}
-                    }}
+                    y: {{ beginAtZero: true, grid: {{ color: 'rgba(255,255,255,0.05)' }}, ticks: {{ color: '#6A6E76' }} }},
+                    x: {{ grid: {{ display: false }}, ticks: {{ color: '#6A6E76', font: {{ size: 10 }} }} }}
                 }}
             }}
         }});
         
-        // Threat Distribution Chart
         const threatCtx = document.getElementById('threatChart').getContext('2d');
         new Chart(threatCtx, {{
             type: 'doughnut',
             data: {{
                 labels: ['HIGH', 'MEDIUM', 'LOW'],
                 datasets: [{{
-                    data: {chart_data["threat_levels"]},
+                    data: {threat_counts},
                     backgroundColor: ['#C9533F', '#E8A33D', '#3D8B82'],
                     borderWidth: 0,
                 }}]
@@ -1169,13 +855,7 @@ async def get_dashboard(db: AsyncSession = Depends(get_db_session)):
                 plugins: {{
                     legend: {{
                         position: 'bottom',
-                        labels: {{
-                            color: '#A8AAB0',
-                            font: {{ size: 11 }},
-                            padding: 12,
-                            usePointStyle: true,
-                            pointStyle: 'circle'
-                        }}
+                        labels: {{ color: '#A8AAB0', font: {{ size: 11 }}, padding: 12, usePointStyle: true, pointStyle: 'circle' }}
                     }}
                 }},
                 cutout: '70%'
@@ -1183,7 +863,6 @@ async def get_dashboard(db: AsyncSession = Depends(get_db_session)):
         }});
     }});
     
-    // Trigger Run
     function triggerRun() {{
         const btn = document.getElementById('run-btn');
         const text = document.getElementById('trigger-text');
@@ -1217,6 +896,7 @@ async def get_dashboard(db: AsyncSession = Depends(get_db_session)):
         import traceback
         error_detail = traceback.format_exc()
         return f"<html><body style='background:#0E0F12;color:#EDEAE3;font-family:sans-serif;padding:40px;'><h1>Error loading dashboard</h1><pre style='color:#E8897A;font-size:13px;'>{error_detail}</pre></body></html>"
+
 
 # Shutdown handler
 @app.on_event("shutdown")
