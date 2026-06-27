@@ -1,5 +1,5 @@
 # stratos/db/__init__.py
-from stratos.db.models import Base, Competitor, Run, RawSnapshot, Signal
+from stratos.db.models import Base, Competitor, Run, RawSnapshot, Signal, RunLog, ProductContext, UserAction, AuditLog
 from stratos.db.session import (
     engine,
     AsyncSessionLocal,

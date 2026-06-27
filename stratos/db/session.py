@@ -1,7 +1,7 @@
 # stratos/db/session.py
 """
 Async database session management using SQLAlchemy.
-Uses NullPool to avoid loop mismatch issues.
+Provides connection pooling and session lifecycle management.
 """
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.pool import NullPool
@@ -32,12 +32,14 @@ def get_async_database_url():
 engine = create_async_engine(
     get_async_database_url(),
     echo=False,
-    poolclass=NullPool,  # <-- This is the key fix
+    poolclass=NullPool,
     pool_pre_ping=True,
+    pool_recycle=3600,
     connect_args={
         "server_settings": {
             "application_name": "stratos",
-        }
+        },
+        "timeout": 10,  # Connection timeout
     }
 )
 

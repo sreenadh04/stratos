@@ -1,15 +1,22 @@
 # scripts/seed_competitors.py
 """
 Seed the database with initial competitors.
-Uses async SQLAlchemy for database operations.
 """
 import os
+import sys
 import asyncio
 import uuid
 from dotenv import load_dotenv
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
-from sqlalchemy import text
+
+# Add parent directory to sys.path so stratos module is found
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from stratos.db.models import Competitor
+from stratos.db.session import get_db_session_manual
+from stratos.db.repositories import CompetitorRepository
+from stratos.logging_config import get_logger
+
+logger = get_logger("seed")
 
 
 def clean_database_url(url: str) -> str:
@@ -31,43 +38,34 @@ async def seed_competitors():
         print("❌ Error: DATABASE_URL not found in .env")
         return False
     
-    # Clean and convert to async URL
-    cleaned_url = clean_database_url(database_url)
-    async_url = cleaned_url.replace("postgresql://", "postgresql+asyncpg://")
-    
     competitors = [
         {
             "name": "OpenAI",
             "website_url": "https://openai.com",
-            "blog_url": "https://openai.com/blog"
+            "blog_url": "https://openai.com/blog",
+            "source_type": "blog"
         },
         {
             "name": "Anthropic",
             "website_url": "https://anthropic.com",
-            "blog_url": "https://www.anthropic.com/news"
+            "blog_url": "https://www.anthropic.com/news",
+            "source_type": "blog"
         },
         {
             "name": "Cohere",
             "website_url": "https://cohere.com",
-            "blog_url": "https://cohere.com/blog"
+            "blog_url": "https://cohere.com/blog",
+            "source_type": "blog"
         }
     ]
     
     try:
-        # Create engine
-        engine = create_async_engine(async_url, echo=False)
-        AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
-        
-        async with AsyncSessionLocal() as session:
-            # Check if competitors already exist
+        async with get_db_session_manual() as session:
+            repo = CompetitorRepository(session)
+            
             for comp in competitors:
                 # Check if exists
-                result = await session.execute(
-                    text("SELECT id FROM competitors WHERE name = :name"),
-                    {"name": comp["name"]}
-                )
-                existing = result.fetchone()
-                
+                existing = await repo.get_by_name(comp["name"])
                 if existing:
                     print(f"⏭️  Skipped (already exists): {comp['name']}")
                     continue
@@ -78,13 +76,13 @@ async def seed_competitors():
                     name=comp["name"],
                     website_url=comp["website_url"],
                     blog_url=comp["blog_url"],
+                    is_active=True,
                 )
                 session.add(competitor)
                 print(f"✅ Seeded: {comp['name']}")
             
             await session.commit()
         
-        await engine.dispose()
         return True
         
     except Exception as e:

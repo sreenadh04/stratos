@@ -29,36 +29,52 @@ async def test_scout_competitor_creates_snapshot():
     mock_run_id = "run-456"
     mock_content = "Test content"
     
+    # Mock the scrape_url_async
     with patch("stratos.agents.scout.scrape_url_async") as mock_scrape:
         mock_scraped = Mock()
         mock_scraped.markdown_content = mock_content
         mock_scrape.return_value = mock_scraped
         
+        # Mock compute_content_hash
         with patch("stratos.agents.scout.compute_content_hash") as mock_hash:
             mock_hash.return_value = "test_hash_123"
             
-            with patch("stratos.agents.scout.get_db_session_manual") as mock_session:
-                mock_session_instance = AsyncMock()
-                mock_session_instance.__aenter__ = AsyncMock(return_value=mock_session_instance)
-                mock_session_instance.__aexit__ = AsyncMock(return_value=None)
-                mock_session.return_value = mock_session_instance
+            # Mock detect_new_posts to return a post
+            with patch("stratos.agents.scout.detect_new_posts") as mock_detect:
+                mock_detect.return_value = [{
+                    "url": mock_blog_url,
+                    "title": mock_name,
+                    "content_hash": "test_hash_123",
+                    "full_content": mock_content,
+                }]
                 
-                with patch("stratos.agents.scout.RawSnapshotRepository") as mock_repo:
-                    mock_repo_instance = AsyncMock()
-                    mock_repo_instance.exists_for_hash.return_value = False
-                    mock_snapshot = Mock()
-                    mock_snapshot.id = "snapshot-789"
-                    mock_repo_instance.create.return_value = mock_snapshot
-                    mock_repo.return_value = mock_repo_instance
+                # Mock get_db_session_manual
+                with patch("stratos.agents.scout.get_db_session_manual") as mock_session:
+                    mock_session_instance = AsyncMock()
+                    mock_session_instance.__aenter__ = AsyncMock(return_value=mock_session_instance)
+                    mock_session_instance.__aexit__ = AsyncMock(return_value=None)
+                    mock_session.return_value = mock_session_instance
                     
-                    from stratos.agents.scout import scout_competitor
-                    result = await scout_competitor(
-                        mock_competitor_id,
-                        mock_name,
-                        mock_blog_url,
-                        mock_run_id
-                    )
-                    
-                    assert len(result) == 1
-                    assert result[0]["competitor_name"] == mock_name
-                    assert result[0]["snapshot_id"] == "snapshot-789"
+                    # Mock RawSnapshotRepository
+                    with patch("stratos.agents.scout.RawSnapshotRepository") as mock_repo:
+                        mock_repo_instance = AsyncMock()
+                        mock_repo_instance.exists_for_hash.return_value = False
+                        mock_snapshot = Mock()
+                        mock_snapshot.id = "snapshot-789"
+                        mock_repo_instance.create.return_value = mock_snapshot
+                        mock_repo.return_value = mock_repo_instance
+                        
+                        # Import the function (now named scout_competitor_with_retry)
+                        from stratos.agents.scout import scout_competitor_with_retry
+                        
+                        result = await scout_competitor_with_retry(
+                            mock_competitor_id,
+                            mock_name,
+                            mock_blog_url,
+                            "blog",
+                            mock_run_id
+                        )
+                        
+                        assert len(result) == 1
+                        assert result[0]["competitor_name"] == mock_name
+                        assert result[0]["snapshot_id"] == "snapshot-789"

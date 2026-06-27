@@ -41,13 +41,13 @@ class Scheduler:
         
         # Also run on startup for testing
         # Comment out or remove for production
-        self.scheduler.add_job(
-            self._run_startup,
-            trigger='date',
-            run_date=datetime.datetime.now() + datetime.timedelta(seconds=10),
-            id='startup_run',
-            name='Startup Test Run'
-        )
+        # self.scheduler.add_job(
+        #     self._run_startup,
+        #     trigger='date',
+        #     run_date=datetime.datetime.now() + datetime.timedelta(seconds=10),
+        #     id='startup_run',
+        #     name='Startup Test Run'
+        # )
         
         logger.info("✅ Scheduler jobs configured")
     
